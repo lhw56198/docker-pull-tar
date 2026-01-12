@@ -15,6 +15,9 @@ import urllib3
 import argparse
 import logging
 import base64
+import zstandard as zstd
+import platform
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Set default encoding to UTF-8
@@ -555,10 +558,29 @@ def download_layers(session, registry, repository, layers, auth_head, imgdir, re
         tar_path = f'{layerdir}/layer.tar'
 
         # 解压gzip文件
+        # 解压文件（支持 gzip 和 zstd）
         if os.path.exists(gz_path):
-            with gzip.open(gz_path, 'rb') as gz, open(tar_path, 'wb') as file:
-                shutil.copyfileobj(gz, file)
-            os.remove(gz_path)
+            try:
+                # 尝试读取文件头来判断格式
+                with open(gz_path, 'rb') as f:
+                    magic = f.read(4)
+
+                # 判断是否为 zstd (Magic number: 0x28 0xB5 0x2F 0xFD)
+                if magic.startswith(b'\x28\xb5\x2f\xfd'):
+                    logger.info(f"检测到 Zstd 压缩: {gz_path}")
+                    dctx = zstd.ZstdDecompressor()
+                    with open(gz_path, 'rb') as ifh, open(tar_path, 'wb') as ofh:
+                        dctx.copy_stream(ifh, ofh)
+                else:
+                    # 默认为 gzip
+                    with gzip.open(gz_path, 'rb') as gz, open(tar_path, 'wb') as file:
+                        shutil.copyfileobj(gz, file)
+
+                os.remove(gz_path)
+            except Exception as e:
+                logger.error(f"解压失败: {e}")
+                # 这里可以选择是否抛出异常或继续
+                raise
 
         json_path = f'{layerdir}/json'
         with open(json_path, 'w') as file:
@@ -581,17 +603,21 @@ def download_layers(session, registry, repository, layers, auth_head, imgdir, re
 
 
 def create_image_tar(imgdir, repository, tag, arch):
-    """将镜像打包为 tar 文件"""
+    """将镜像打包为 tar.gz 文件"""
     safe_repo = repository.replace("/", "_")
-    docker_tar = f'{safe_repo}_{tag}_{arch}.tar'
+    # 修改文件名后缀为 .tar.gz
+    docker_tar = f'{safe_repo}_{tag}_{arch}.tar.gz'
     try:
-        with tarfile.open(docker_tar, "w") as tar:
+        # 修改模式为 "w:gz" 以启用 gzip 压缩
+        # compresslevel=6 是默认值，平衡速度和压缩率。如果想要更小体积但更慢，可以设为 9
+        with tarfile.open(docker_tar, "w:gz", compresslevel=6) as tar:
             tar.add(imgdir, arcname='/')
-        logger.debug(f'Docker 镜像已拉取：{docker_tar}')
+        logger.debug(f'Docker 镜像已压缩打包：{docker_tar}')
         return docker_tar
     except Exception as e:
         logger.error(f'打包镜像失败: {e}')
         raise
+
 
 
 def cleanup_tmp_dir():
@@ -609,12 +635,29 @@ def cleanup_tmp_dir():
 def main():
     """主函数"""
     try:
+        # --- 新增：架构自动检测逻辑 ---
+        system_arch_raw = platform.machine().lower()
+        default_arch = 'amd64'  # 默认兜底值
+
+        # 简单的架构映射
+        if system_arch_raw in ['x86_64', 'amd64']:
+            default_arch = 'amd64'
+        elif system_arch_raw in ['aarch64', 'arm64']:
+            default_arch = 'arm64'
+        elif system_arch_raw.startswith('arm'):
+            default_arch = 'arm'
+        # ---------------------------
+
         parser = argparse.ArgumentParser(description="Docker 镜像拉取工具")
         parser.add_argument("-i", "--image", required=False,
                             help="Docker 镜像名称（例如：nginx:latest 或 harbor.abc.com/abc/nginx:1.26.0）")
         parser.add_argument("-q", "--quiet", action="store_true", help="静默模式，减少交互")
         parser.add_argument("-r", "--custom_registry", help="自定义仓库地址（例如：harbor.abc.com）")
-        parser.add_argument("-a", "--arch", help="架构,默认：amd64,常见：amd64, arm64v8等")
+
+        # 修改帮助文本，显示检测到的默认架构
+        parser.add_argument("-a", "--arch",
+                            help=f"架构 (默认: {default_arch}, 当前设备检测为: {system_arch_raw})")
+
         parser.add_argument("-u", "--username", help="Docker 仓库用户名")
         parser.add_argument("-p", "--password", help="Docker 仓库密码")
         parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {VERSION}", help="显示版本信息")
@@ -622,6 +665,7 @@ def main():
 
         # 显示程序的信息
         logger.info(f'欢迎使用 Docker 镜像拉取工具 {VERSION}')
+        logger.info(f'当前系统架构: {system_arch_raw} (默认将拉取: {default_arch})')
 
         args = parser.parse_args()
 
@@ -635,15 +679,19 @@ def main():
                 logger.error("错误：镜像名称是必填项。")
                 return
 
-        # # 获取架构
-        # if not args.arch and not args.quiet:
-        #     args.arch = input("请输入架构（常见: amd64, arm64v8等，默认: amd64）：").strip() or 'amd64'
+        # --- 修改：架构设置逻辑 ---
+        if not args.arch:
+            if args.quiet:
+                # 静默模式下，直接使用自动检测的架构
+                args.arch = default_arch
+            else:
+                # 交互模式下，提示用户（带默认值）
+                user_input = input(f"请输入架构（默认: {default_arch}）：").strip()
+                args.arch = user_input if user_input else default_arch
+        # -----------------------
 
         # 获取自定义仓库地址
         if not args.custom_registry and not args.quiet:
-            # use_custom_registry = input("是否使用自定义仓库地址？(y/n, 默认: y): ").strip().lower() or 'y'
-            # if use_custom_registry == 'y':
-            #     args.custom_registry = input("请输入自定义仓库地址: )").strip()
             args.custom_registry = input("请输入自定义仓库地址: （默认 dockerhub）").strip()
 
         # 解析镜像信息
@@ -654,25 +702,39 @@ def main():
             args.username = input("请输入镜像仓库用户名: ").strip()
         if not args.password and not args.quiet:
             args.password = input("请输入镜像仓库密码: ").strip()
+
         session = create_session()
         auth_head = None
         try:
             url = f'https://{registry}/v2/'
             logger.debug(f"获取认证信息 CURL 命令: curl '{url}'")
             resp = session.get(url, verify=False, timeout=30)
-            auth_url = resp.headers['WWW-Authenticate'].split('"')[1]
-            reg_service = resp.headers['WWW-Authenticate'].split('"')[3]
-            auth_head = get_auth_head(session, auth_url, reg_service, repository, args.username, args.password)
-            # 获取清单
+
+            # 处理部分仓库没有返回 WWW-Authenticate 头的情况
+            if 'WWW-Authenticate' in resp.headers:
+                auth_url = resp.headers['WWW-Authenticate'].split('"')[1]
+                reg_service = resp.headers['WWW-Authenticate'].split('"')[3]
+                auth_head = get_auth_head(session, auth_url, reg_service, repository, args.username, args.password)
+            else:
+                # 部分私有仓库可能不需要 token 或者通过其他方式认证，尝试匿名或直接访问
+                auth_head = {}
+
+                # 获取清单
             resp, http_code = fetch_manifest(session, registry, repository, tag, auth_head)
+
+            # 处理 401 认证请求
             if http_code == 401:
+                if 'WWW-Authenticate' in resp.headers:
+                    auth_url = resp.headers['WWW-Authenticate'].split('"')[1]
+                    reg_service = resp.headers['WWW-Authenticate'].split('"')[3]
+
                 use_auth = input(f"当前仓库 {registry}，需要登录？(y/n, 默认: y): ").strip().lower() or 'y'
                 if use_auth == 'y':
                     args.username = input("请输入用户名: ").strip()
                     args.password = input("请输入密码: ").strip()
-                auth_head = get_auth_head(session, auth_url, reg_service, repository, args.username, args.password)
+                    auth_head = get_auth_head(session, auth_url, reg_service, repository, args.username, args.password)
+                    resp, http_code = fetch_manifest(session, registry, repository, tag, auth_head)
 
-            resp, http_code = fetch_manifest(session, registry, repository, tag, auth_head)
         except requests.exceptions.RequestException as e:
             logger.error(f'连接仓库失败: {e}')
             raise
@@ -694,9 +756,14 @@ def main():
                 args.arch = archs[0]
                 logger.info(f'自动选择唯一可用架构: {args.arch}')
 
-            # 获取架构
-            if not args.arch or args.arch not in archs:
-                args.arch = input(f"请输入架构（可选: {', '.join(archs)}，默认: amd64）：").strip() or 'amd64'
+            # 如果之前选择的默认架构不在可用列表中，再次询问
+            if args.arch not in archs:
+                if args.quiet:
+                    logger.warning(f"默认架构 {args.arch} 不在可用列表 {archs} 中，尝试使用第一个可用架构。")
+                    args.arch = archs[0]
+                else:
+                    logger.warning(f"注意：您选择的架构 {args.arch} 不在当前镜像支持列表中。")
+                    args.arch = input(f"请重新输入架构（可选: {', '.join(archs)}）：").strip() or archs[0]
 
             digest = select_manifest(manifests, args.arch)
             if not digest:
@@ -760,8 +827,6 @@ def main():
         if registry not in ("registry-1.docker.io", "docker.io"):
             logger.info(f'您可能需要: docker tag {repository}:{tag} {registry}/{repository}:{tag}')
 
-
-
     except KeyboardInterrupt:
         logger.info('用户取消操作。')
     except requests.exceptions.RequestException as e:
@@ -780,9 +845,10 @@ def main():
     finally:
         cleanup_tmp_dir()
         try:
-            input("按任意键退出程序...")
+            # 只有在非 quiet 模式下才暂停，方便自动化脚本调用
+            if 'args' in locals() and not args.quiet:
+                input("按任意键退出程序...")
         except (KeyboardInterrupt, EOFError):
-            # 用户按Ctrl+C或在非交互环境中运行
             pass
         sys.exit(0)
 
