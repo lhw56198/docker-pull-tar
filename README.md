@@ -99,7 +99,7 @@ python docker_image_puller.py -i alpine -a arm64 -r 1ms.run --debug
 ## 内网 Docker 导入方法
 
 1. **拉取镜像并打包**  
-   使用本工具拉取镜像并生成 `.tar` 文件，例如 `library_alpine.tar`。
+   使用本工具拉取镜像并生成 `.tar` 文件，例如 `library_alpine.tar.gz`。
 
 2. **将 `.tar` 文件传输到内网机器**  
    通过 U 盘、内网文件服务器或其他方式将 `.tar` 文件传输到目标机器。
@@ -108,7 +108,7 @@ python docker_image_puller.py -i alpine -a arm64 -r 1ms.run --debug
    在内网机器上运行以下命令导入镜像：
 
    ```bash
-   docker load -i library_alpine.tar
+   docker load -i library_alpine.tar.gz
    ```
 
 4. **验证镜像**  
@@ -152,7 +152,7 @@ python docker_image_puller.py -i alpine -a arm64 -r 1ms.run --debug
 **A**: 不需要！直接下载 `DockerPull.exe` 即可运行。
 
 **Q**: 如何在内网中使用？  
-**A**: 使用本工具拉取镜像并生成 `.tar` 文件，然后通过 `docker load` 命令导入内网机器。
+**A**: 使用本工具拉取镜像并生成 `.tar.gz` 文件，然后通过 `docker load` 命令导入内网机器。
 
 ---
 
